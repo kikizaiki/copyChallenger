@@ -1,0 +1,21 @@
+# Editors
+.vscode/
+.idea/
+.cursor/
+
+# OS
+.DS_Store
+
+# Node (if you ever add tooling)
+node_modules/
+dist/
+build/
+
+# Google Apps Script / clasp
+.clasp.json
+.claspignore
+.gcloud/
+
+# Logs
+*.log
+
