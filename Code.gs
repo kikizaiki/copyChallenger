@@ -8,6 +8,7 @@
 const AI_EDITOR_MENU_ROOT = "AI-Редактор";
 const MENU_CURRENT_ROW = "Обработать текущую строку";
 const MENU_SELECTED_RANGE = "Обработать выделенный диапазон";
+const LOG_SHEET_NAME = "Logs";
 
 // "Main" columns (1-indexed)
 const COL_CHANNEL = 3; // C
@@ -38,8 +39,11 @@ function processActiveRow_() {
     return;
   }
 
+  const extra = promptForExtraPrompt_();
+  if (extra === null) return;
+
   const row = range.getRow();
-  processRows_(sheet, [row]);
+  processRows_(sheet, [row], extra);
 }
 
 function processSelectedRange_() {
@@ -60,11 +64,34 @@ function processSelectedRange_() {
   const numRows = range.getNumRows();
   const rows = [];
   for (let i = 0; i < numRows; i++) rows.push(startRow + i);
-  processRows_(sheet, rows);
+
+  const extra = promptForExtraPrompt_();
+  if (extra === null) return;
+
+  processRows_(sheet, rows, extra);
 }
 
-function processRows_(mainSheet, rows) {
+/**
+ * Всплывающее окно: опционально дополнить промпт своим текстом.
+ * @returns {string|null} текст дополнения или null, если пользователь нажал «Отмена»
+ */
+function promptForExtraPrompt_() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(
+    "Дополнить промпт",
+    "Можно добавить свои пожелания к генерации комментария (тон, акценты, что важно учесть). Оставьте поле пустым — будет использован только стандартный промпт.",
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response.getSelectedButton() !== ui.Button.OK) {
+    return null;
+  }
+  return (response.getResponseText() || "").trim();
+}
+
+function processRows_(mainSheet, rows, extraUserPrompt) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureLogSheet_(ss); // Лист логов должен существовать всегда, даже если ошибок не было.
+  appendLog_("RUN_START", "", `Запуск обработки: ${rows.length} строк`, "");
   const settings = getSettingsSheet_(ss);
   if (!settings) return;
 
@@ -73,6 +100,9 @@ function processRows_(mainSheet, rows) {
 
   const goldenRules = getGoldenRules_(settings);
   const movieInfo = (mainSheet.getRange("A1").getDisplayValue() || "").trim();
+  let writtenCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
 
   const today = new Date();
   const todayAt00 = new Date(today.getFullYear(), today.getMonth(), today.getDate());
@@ -81,7 +111,10 @@ function processRows_(mainSheet, rows) {
     const row = rows[idx];
 
     const postText = (mainSheet.getRange(row, COL_POST_TEXT).getDisplayValue() || "").trim();
-    if (!postText) continue; // Требование: если текст пустой — пропускать строку
+    if (!postText) {
+      skippedCount++; // Требование: если текст пустой — пропускать строку
+      continue;
+    }
 
     const channel = (mainSheet.getRange(row, COL_CHANNEL).getDisplayValue() || "").trim();
     const adMarkRaw = (mainSheet.getRange(row, COL_AD_MARK).getDisplayValue() || "").trim();
@@ -102,18 +135,29 @@ function processRows_(mainSheet, rows) {
       goldenRules,
       postText,
       rowId: row,
+      extraUserPrompt: extraUserPrompt || "",
     });
 
-    const comment = callAiChatCompletions_(api, prompt);
+    const comment = callAiChatCompletions_(api, prompt, row);
     if (comment) {
       mainSheet.getRange(row, COL_OUTPUT).setValue(comment);
+      writtenCount++;
+    } else {
+      failedCount++;
     }
   }
+
+  const summary =
+    `Готово: ${writtenCount}. Пропущено: ${skippedCount}. Ошибок: ${failedCount}.` +
+    (failedCount > 0 ? ` Подробности на листе "${LOG_SHEET_NAME}".` : "");
+  appendLog_("RUN_SUMMARY", "", summary, `rows=${rows.length}`);
+  ss.toast(summary, "AI-Редактор", 10);
 }
 
 function getSettingsSheet_(ss) {
   const settings = ss.getSheetByName("Settings");
   if (!settings) {
+    appendLog_("CONFIG_ERROR", "", 'Не найден лист "Settings"', "");
     ss.toast('Не найден лист "Settings".', "AI-Редактор", 10);
     return null;
   }
@@ -126,6 +170,12 @@ function getApiConfig_(settingsSheet) {
   const model = (settingsSheet.getRange("C2").getDisplayValue() || "").trim();
 
   if (!apiKey || !apiUrl || !model) {
+    appendLog_(
+      "CONFIG_ERROR",
+      "",
+      'Проверьте "Settings": A2 (API Key), B2 (API URL), C2 (Model).',
+      `A2=${apiKey ? "OK" : "EMPTY"}, B2=${apiUrl ? "OK" : "EMPTY"}, C2=${model ? "OK" : "EMPTY"}`
+    );
     SpreadsheetApp.getActiveSpreadsheet().toast(
       'Проверьте "Settings": A2 (API Key), B2 (API URL), C2 (Model).',
       "AI-Редактор",
@@ -134,7 +184,22 @@ function getApiConfig_(settingsSheet) {
     return null;
   }
 
-  return { apiKey, apiUrl, model };
+  const normalizedUrl = normalizeChatCompletionsUrl_(apiUrl);
+  return { apiKey, apiUrl: normalizedUrl, model };
+}
+
+/**
+ * OpenAI-совместимые провайдеры (Polza.ai, OpenRouter, ProxyAPI и т.д.) ожидают POST на .../chat/completions.
+ * В Settings часто указывают только базу: https://polza.ai/api/v1 — без суффикса.
+ */
+function normalizeChatCompletionsUrl_(url) {
+  var u = (url || "").trim().replace(/\/+$/, "");
+  if (!u) return "";
+  var lower = u.toLowerCase();
+  if (lower.indexOf("/chat/completions") !== -1) return u;
+  if (lower.endsWith("/v1")) return u + "/chat/completions";
+  if (lower.endsWith("/api")) return u + "/v1/chat/completions";
+  return u + "/chat/completions";
 }
 
 function getGoldenRules_(settingsSheet) {
@@ -182,7 +247,17 @@ function getTimingLabel_(postDate, todayAt00) {
   return dAt00.getTime() <= todayAt00.getTime() ? "уже в кино" : "скоро";
 }
 
-function buildPrompt_({ movieInfo, channel, adMark, adMarkRaw, timing, goldenRules, postText, rowId }) {
+function buildPrompt_({
+  movieInfo,
+  channel,
+  adMark,
+  adMarkRaw,
+  timing,
+  goldenRules,
+  postText,
+  rowId,
+  extraUserPrompt,
+}) {
   const channelLc = (channel || "").toLowerCase();
   const isVkLike = /(^|[\s\W])vk($|[\s\W])/.test(channelLc) || /вк/.test(channelLc) || channelLc.includes("vk");
 
@@ -191,32 +266,69 @@ function buildPrompt_({ movieInfo, channel, adMark, adMarkRaw, timing, goldenRul
     : "- (список золотых правил пуст)";
 
   const systemPrompt =
+    `**Роль (System):**\n` +
     `Ты опытный SMM-редактор (ЦПШ/GPM), проверяешь работу копирайтера.\n` +
-    `Твоя задача: по контексту канала и поста подготовить уникальный редакторский комментарий.\n\n` +
-    `Контекст канала: ${channel || "(не указан)"}.\n` +
-    (isVkLike
-      ? `В канале ВК запрещены прямые обращения «ты/вы». Используй безличные формулировки или обращения к ситуации, но не к читателю напрямую.\n`
-      : "") +
-    `Рекламная метка: ${adMark ? "есть (усилить CTA)" : "нет (делать нативный сторителлинг)"} (как в ячейке D: "${adMarkRaw}").\n` +
-    `Тайминг: если ${timing === "уже в кино" ? "премьера прошла" : "премьера ещё не прошла"}, используйте формулировки соответствующего статуса: "${timing}".\n\n` +
-    `Стиль комментариев:\n` +
-    `- Комментарий должен быть уникальным по формулировкам для каждой строки.\n` +
-    `- Избегай канцеляризмов и «пресс-релизности».\n` +
-    `- Используй кавычки «…» для примеров формулировок.\n` +
-    `- Вариативность длины: коротко (1 предложение) или средне (2–3) или развернуто (3–4) — выбирай подходящий размер под контекст.\n` +
-    `- Соблюдай правила пунктуации и типичные правки к тире/дефисам; акценты делай на актёров/персонажей, если они есть в тексте.\n\n` +
+    `Пишешь как настоящий редактор-клиент: коротко, по делу, профессионально, но с живостью. Без сленга и излишнего официоза.\n\n` +
+    `**Задача:**\n` +
+    `Подготовь редакторский комментарий для одной строки таблицы — что именно поправить/усилить в тексте поста.\n\n` +
+    `**Входные данные (для одной строки):**\n` +
+    `1. **Excel-строка** — исходный текст поста + метаданные строки (канал, рекламная метка, тайминг).\n` +
+    `2. **Документ с комментариями клиента (Золотые правила)** — набор правил из Settings.\n` +
+    `3. **Бриф по фильму** — информация из Main!A1.\n\n` +
     `Золотые правила клиента:\n${goldenRulesBlock}\n\n` +
-    `Вывод: верни только готовый редакторский комментарий одной фразой/абзацем на русском без заголовков, раздели его на список.\n` +
-    `Ограничение: не повторяй предыдущие варианты текста; используй уникальные формулировки (ориентир: строка ${rowId}).`;
+    `---\n` +
+    `### **Что нужно сделать:**\n` +
+    `1. Проанализируй исходный пост и подумай, как клиент обычно формулирует правки: тон, структура, уровень эмоций, тип предложений.\n` +
+    `2. Учитывай специфику канала (включая запреты ВК на прямые обращения «ты/вы»).\n` +
+    `3. Учитывай рекламную метку: если метка **есть** — усили CTA; если **нет** — делай нативный сторителлинг.\n` +
+    `4. Учитывай тайминг: «уже в кино» или «скоро» — формулировки должны поддерживать статус.\n` +
+    `5. Сформулируй уникальный редакторский комментарий: конкретно что поправить и где усилить.\n\n` +
+    `---\n` +
+    `### **Требования к комментариям:**\n` +
+    `* **Каждый комментарий должен быть уникальным**: не повторяй формулировки и не копируй структуру “слово в слово” от строки к строке.\n` +
+    `* **Стиль — “редактор-клиент”.** Коротко, по делу, профессионально, но с живостью.\n` +
+    `* **Тон и формат варьируй.** Чередуй длину: короткие (1 предложение), средние (2–3), развёрнутые (3–4) — под плотность исходного текста.\n` +
+    `* **Похвала.** Если в тексте есть отличные заходы – надо похвалить копирайтера.\n` +
+    `* **Типы комментариев (чередовать):**\n` +
+    `  * замечание по тону (*«звучит прессрелизно, нужно живее»*);\n` +
+    `  * пример формулировки (*«можно начать с “…”»*);\n` +
+    `  * риторический вопрос (*«А если добавить …?»*);\n` +
+    `  * структурная подсказка (*«начать с действия, не с описания»*);\n` +
+    `  * личное редакторское наблюдение (*«хочется чуть теплее/ближе к герою»*).\n` +
+    `* **По смыслу комментарий должен:** усиливать жанровое восприятие; предлагать конкретные правки без лишней “воды”; содержать живые фразы и примеры в кавычках «…».\n` +
+    `* **Анти-повторы (важно):** не используй одни и те же обороты «убрать прессрелизность», «добавить эмоцию», «сделать живее»; если используешь эти смыслы — перефразируй и меняй контекст.\n\n` +
+    `* **Антишаблоны (важно):** не используй тривиальный CTA в виде фразы «смотрите в кино» и прямых её вариаций. Для CTA подбирай более живые формулировки, которые поддерживают статус «уже в кино»/«скоро», но звучат как редакторская ремарка, а не как рекламный шаблон.\n` +
+    (isVkLike
+      ? `* **Специфика ВК:** запрещены прямые обращения к читателю «ты/вы». Используй безличные формулировки или обращение к ситуации/ходу текста, но не к аудитории напрямую.\n`
+      : "") +
+    `---\n` +
+    `### **Формат вывода:**\n` +
+    `Верни *только готовый редакторский комментарий* на русском.\n` +
+    `Никаких заголовков. Один абзац (3–7 предложения).\n\n` +
+    `---\n` +
+    `### **Технические требования (внутренние для ChatGPT):**\n` +
+    `* Используй ротацию не менее 25 шаблонов комментариев разного типа.\n` +
+    `* Не допускай повторов ни по смыслу, ни по структуре.\n` +
+    `* Следи, чтобы комментарии выглядели естественно (как от разных редакторов).\n` +
+    `* Чередуй ритм предложений: короткие, длинные, комбинированные.\n` +
+    `* Учитывай данные из брифа: настроение фильма, жанр, эмоциональный ключ.\n` +
+    `* При необходимости добавляй 1 небольшой конкретный пример формулировки в кавычках «…».\n\n` +
+    `Ограничение: комментарий должен быть уникальным для строки ${rowId}.`;
+
+  const extraBlock =
+    extraUserPrompt && extraUserPrompt.length > 0
+      ? `\n**Дополнительные пожелания редактора (учти в приоритете, не противоречь золотым правилам):**\n${extraUserPrompt}\n`
+      : "";
 
   const userPrompt =
-    `Исходные данные:\n` +
-    `1) Инфо о фильме (из A1): ${movieInfo || "(пусто)"}\n` +
-    `2) Канал: ${channel || "(пусто)"}\n` +
-    `3) Рекламная метка: ${adMark ? "есть" : "нет"}\n` +
-    `4) Статус по таймингу: ${timing}\n` +
-    `5) Текст поста (из G): ${postText}\n\n` +
-    `Сформируй редакторский комментарий: что бы ты поправил/усилил в тексте поста, учитывая метку (CTA или нативность) и статус (уже/скоро).`;
+    `Исходные данные (для строки ${rowId}):\n` +
+    `1) Бриф по фильму (Main!A1): ${movieInfo || "(пусто)"}\n` +
+    `2) Канал (Main!C): ${channel || "(пусто)"}\n` +
+    `3) Рекламная метка (Main!D): ${adMark ? "есть" : "нет"} (как в ячейке D: "${adMarkRaw}")\n` +
+    `4) Тайминг (Main!E): ${timing}\n` +
+    `5) Текст поста (Main!G): ${postText}\n` +
+    extraBlock +
+    `\nСформируй редакторский комментарий: что именно поправить/усилить, учитывая метку (CTA или нативность) и тайминг (уже в кино/скоро).`;
 
   return {
     model: null, // задается в callAiChatCompletions_
@@ -227,31 +339,43 @@ function buildPrompt_({ movieInfo, channel, adMark, adMarkRaw, timing, goldenRul
   };
 }
 
-function callAiChatCompletions_(api, prompt) {
-  const body = {
+function callAiChatCompletions_(api, prompt, row) {
+  const bannedNeedle = "смотрите в кино";
+
+  const baseBody = {
     model: api.model,
-    messages: prompt.messages,
     // Небольшая вариативность, чтобы не копировать один и тот же шаблон
-    temperature: 0.9,
+    temperature: 1,
   };
 
-  const options = {
+  const optionsBase = {
     method: "post",
     contentType: "application/json",
     headers: {
       Authorization: `Bearer ${api.apiKey}`,
+      Accept: "application/json",
     },
-    payload: JSON.stringify(body),
     muteHttpExceptions: true,
   };
 
+  const antiTemplateSystem =
+    `Антишаблон: категорически избегай тривиального CTA «${bannedNeedle}» и любых прямых вариаций. Придумай более живую редакторскую ремарку, которая поддерживает статус «уже в кино»/«скоро», но звучит свежо.`;
+
+  const messages = prompt.messages.concat([{ role: "system", content: antiTemplateSystem }]);
+
+  const body = Object.assign({}, baseBody, { messages });
+  const options = Object.assign({}, optionsBase, {
+    payload: JSON.stringify(body),
+  });
+
+  let lastContent = "";
   try {
     const resp = UrlFetchApp.fetch(api.apiUrl, options);
     const code = resp.getResponseCode();
     const text = resp.getContentText();
 
     if (code < 200 || code >= 300) {
-      throw new Error(`AI API HTTP ${code}: ${text}`);
+      throw new Error(`HTTP ${code}: ${text}`);
     }
 
     const json = JSON.parse(text);
@@ -260,12 +384,43 @@ function callAiChatCompletions_(api, prompt) {
       json?.choices?.[0]?.text ||
       json?.data?.[0]?.content;
 
-    if (!content) return "";
-    return content.toString().trim();
+    if (!content) {
+      appendLog_("EMPTY_RESPONSE", row, "Пустой ответ от AI API", text);
+      return "";
+    }
+    lastContent = content.toString().trim();
   } catch (e) {
-    SpreadsheetApp.getActiveSpreadsheet().toast(`Ошибка AI: ${e.message}`, "AI-Редактор", 20);
+    const errorMessage = e && e.message ? e.message : String(e);
+    appendLog_("AI_ERROR", row, errorMessage, "");
+    SpreadsheetApp.getActiveSpreadsheet().toast(`Ошибка AI (строка ${row}): ${errorMessage}`, "AI-Редактор", 20);
     Logger.log(e);
     return "";
   }
+
+  // Если модель всё равно вернула запрещённую фразу — обезвреживаем точную подстроку.
+  if (lastContent && lastContent.toLowerCase().includes(bannedNeedle)) {
+    return lastContent.replace(/смотрите в кино/gi, "можно будет увидеть в кинотеатрах");
+  }
+  return lastContent || "";
+}
+
+function appendLog_(type, row, message, details) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ensureLogSheet_(ss);
+  sheet.appendRow([new Date(), type, row || "", message || "", details || ""]);
+}
+
+function ensureLogSheet_(ss) {
+  let sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(LOG_SHEET_NAME);
+  }
+  const header = sheet.getRange(1, 1, 1, 5).getValues()[0];
+  const hasHeader = header.some((v) => String(v || "").trim() !== "");
+  if (!hasHeader) {
+    sheet.getRange(1, 1, 1, 5).setValues([["timestamp", "type", "row", "message", "details"]]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
 }
 

@@ -19,3 +19,6 @@ build/
 # Logs
 *.log
 
+# Local working docs (not part of the automation deliverable)
+inbox/
+
