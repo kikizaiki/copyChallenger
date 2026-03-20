@@ -10,6 +10,12 @@ const MENU_CURRENT_ROW = "Обработать текущую строку";
 const MENU_SELECTED_RANGE = "Обработать выделенный диапазон";
 const LOG_SHEET_NAME = "Logs";
 
+/**
+ * Надстройка «свой промпт»: если true — перед обработкой показывается диалог «Дополнить промпт».
+ * Поставьте false при тестах, чтобы сразу вызывать API без окна (дополнительный текст не добавляется).
+ */
+const ENABLE_EXTRA_PROMPT_DIALOG = true;
+
 // "Main" columns (1-indexed)
 const COL_CHANNEL = 3; // C
 const COL_AD_MARK = 4; // D
@@ -39,7 +45,7 @@ function processActiveRow_() {
     return;
   }
 
-  const extra = promptForExtraPrompt_();
+  const extra = getExtraPromptFromUser_();
   if (extra === null) return;
 
   const row = range.getRow();
@@ -65,10 +71,21 @@ function processSelectedRange_() {
   const rows = [];
   for (let i = 0; i < numRows; i++) rows.push(startRow + i);
 
-  const extra = promptForExtraPrompt_();
+  const extra = getExtraPromptFromUser_();
   if (extra === null) return;
 
   processRows_(sheet, rows, extra);
+}
+
+/**
+ * Учитывает ENABLE_EXTRA_PROMPT_DIALOG: при false возвращает "" без диалога.
+ * @returns {string|null} дополнение к промпту, "" если выключено, null если в диалоге нажали «Отмена»
+ */
+function getExtraPromptFromUser_() {
+  if (!ENABLE_EXTRA_PROMPT_DIALOG) {
+    return "";
+  }
+  return promptForExtraPrompt_();
 }
 
 /**
