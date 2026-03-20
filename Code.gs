@@ -14,7 +14,7 @@ const LOG_SHEET_NAME = "Logs";
  * Надстройка «свой промпт»: если true — перед обработкой показывается диалог «Дополнить промпт».
  * Поставьте false при тестах, чтобы сразу вызывать API без окна (дополнительный текст не добавляется).
  */
-const ENABLE_EXTRA_PROMPT_DIALOG = true;
+const ENABLE_EXTRA_PROMPT_DIALOG = false;
 
 // "Main" columns (1-indexed)
 const COL_CHANNEL = 3; // C
@@ -401,6 +401,18 @@ function callAiChatCompletions_(api, prompt, row) {
       json?.choices?.[0]?.text ||
       json?.data?.[0]?.content;
 
+    const usageInfo = extractUsageFromChatJson_(json);
+    if (usageInfo) {
+      appendLog_(
+        "USAGE",
+        row,
+        (api.model ? "model: " + api.model + " | " : "") + usageInfo.summaryLine,
+        usageInfo.detailsJson,
+        usageInfo.costRub,
+        usageInfo.totalTokens
+      );
+    }
+
     if (!content) {
       appendLog_("EMPTY_RESPONSE", row, "Пустой ответ от AI API", text);
       return "";
@@ -421,10 +433,72 @@ function callAiChatCompletions_(api, prompt, row) {
   return lastContent || "";
 }
 
-function appendLog_(type, row, message, details) {
+/**
+ * Новые события — сверху (строка 2, под заголовком). costRub / totalTokens — для Polza usage (руб., токены).
+ */
+function appendLog_(type, row, message, details, costRub, totalTokens) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ensureLogSheet_(ss);
-  sheet.appendRow([new Date(), type, row || "", message || "", details || ""]);
+  const cr = costRub === undefined || costRub === null ? "" : costRub;
+  const tt = totalTokens === undefined || totalTokens === null ? "" : totalTokens;
+  sheet.insertRowBefore(2);
+
+  const rowData = [
+    new Date(),
+    cellScalar_(type),
+    cellScalar_(row),
+    cellScalar_(message),
+    cellScalar_(details),
+    cr,
+    tt,
+  ];
+  if (rowData.length !== 7) {
+    throw new Error("appendLog_: ожидается 7 колонок");
+  }
+  writeLogRowCells_(sheet, 2, rowData);
+}
+
+/**
+ * Polza.ai и др. OpenAI-совместимые ответы: объект usage с cost_rub / cost и токенами.
+ * @see https://polza.ai/docs/osobennosti/usage
+ */
+function extractUsageFromChatJson_(json) {
+  const u = json && json.usage;
+  if (!u || typeof u !== "object") return null;
+  const hasAny =
+    u.prompt_tokens != null ||
+    u.completion_tokens != null ||
+    u.total_tokens != null ||
+    u.cost_rub != null ||
+    u.cost != null;
+  if (!hasAny) return null;
+
+  const costRaw = u.cost_rub != null ? u.cost_rub : u.cost;
+  let costRub = "";
+  if (costRaw != null && String(costRaw).trim() !== "") {
+    const n = Number(costRaw);
+    costRub = isNaN(n) ? "" : n;
+  }
+
+  let totalTokens = "";
+  if (u.total_tokens != null && String(u.total_tokens).trim() !== "") {
+    const t = Number(u.total_tokens);
+    totalTokens = isNaN(t) ? "" : t;
+  }
+
+  const parts = [];
+  if (costRub !== "") parts.push("≈ " + String(costRub) + " ₽");
+  if (u.total_tokens != null) parts.push("tokens: " + u.total_tokens);
+  if (u.prompt_tokens != null) parts.push("in: " + u.prompt_tokens);
+  if (u.completion_tokens != null) parts.push("out: " + u.completion_tokens);
+
+  const summaryLine = parts.length ? parts.join(" · ") : "usage";
+  return {
+    summaryLine: summaryLine,
+    detailsJson: JSON.stringify(u),
+    costRub: costRub,
+    totalTokens: totalTokens,
+  };
 }
 
 function ensureLogSheet_(ss) {
@@ -432,12 +506,53 @@ function ensureLogSheet_(ss) {
   if (!sheet) {
     sheet = ss.insertSheet(LOG_SHEET_NAME);
   }
-  const header = sheet.getRange(1, 1, 1, 5).getValues()[0];
-  const hasHeader = header.some((v) => String(v || "").trim() !== "");
+  const fullHeader = [
+    "timestamp",
+    "type",
+    "row",
+    "message",
+    "details",
+    "cost_rub",
+    "total_tokens",
+  ];
+  const header = sheet.getRange(1, 1, 1, 7).getValues()[0];
+  const hasHeader = header.slice(0, 5).some((v) => String(v || "").trim() !== "");
   if (!hasHeader) {
-    sheet.getRange(1, 1, 1, 5).setValues([["timestamp", "type", "row", "message", "details"]]);
+    writeLogRowCells_(sheet, 1, fullHeader);
     sheet.setFrozenRows(1);
+  } else {
+    const needCols = !String(header[5] || "").trim() || !String(header[6] || "").trim();
+    if (needCols) {
+      const merged = header.slice(0, 7);
+      while (merged.length < 7) merged.push("");
+      for (let i = 0; i < 7; i++) {
+        if (!String(merged[i] || "").trim()) merged[i] = fullHeader[i];
+      }
+      writeLogRowCells_(sheet, 1, merged);
+    }
   }
   return sheet;
+}
+
+/** Скаляр в ячейку: массивы/объекты → JSON, чтобы не ломать setValues. */
+function cellScalar_(v) {
+  if (v == null) return "";
+  if (v instanceof Date) return v;
+  if (typeof v === "object") {
+    try {
+      return JSON.stringify(v);
+    } catch (e) {
+      return String(v);
+    }
+  }
+  return String(v);
+}
+
+/** Запись строки лога по ячейкам (устойчиво к объединениям и странным размерам диапазона). */
+function writeLogRowCells_(sheet, rowIndex, values) {
+  const row = values.map((v) => (v instanceof Date ? v : v === "" || v == null ? "" : v));
+  for (let c = 0; c < row.length; c++) {
+    sheet.getRange(rowIndex, c + 1).setValue(row[c]);
+  }
 }
 
